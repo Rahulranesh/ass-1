@@ -1,0 +1,451 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+
+Description: >
+  Student Portal — Full-Stack AWS Application
+  Includes: Cognito, API Gateway, Lambda, RDS PostgreSQL, DynamoDB, S3, CloudFront
+
+# =============================================================================
+# PARAMETERS — override on deploy: sam deploy --parameter-overrides ...
+# =============================================================================
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Deployment environment.
+
+  DBPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 12
+    Description: Master password for the RDS PostgreSQL instance.
+
+  DBUsername:
+    Type: String
+    Default: studentadmin
+    Description: Master username for the RDS PostgreSQL instance.
+
+  CognitoFromEmail:
+    Type: String
+    Default: no-reply@studentportal.example.com
+    Description: The "From" email address for Cognito emails.
+
+# =============================================================================
+# GLOBALS — applied to all Lambda functions
+# =============================================================================
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 30
+    MemorySize: 256
+    Architectures: [arm64]
+    Environment:
+      Variables:
+        ENVIRONMENT: !Ref Environment
+        COGNITO_USER_POOL_ID: !Ref CognitoUserPool
+        COGNITO_APP_CLIENT_ID: !Ref CognitoUserPoolClient
+        DB_HOST: !GetAtt RDSInstance.Endpoint.Address
+        DB_PORT: "5432"
+        DB_NAME: studentportal
+        DB_USER: !Ref DBUsername
+        DB_PASSWORD: !Ref DBPassword
+        DYNAMODB_TABLE: !Ref SessionTable
+        AWS_REGION: !Ref AWS::Region
+    Layers:
+      - !Ref PsycopgLayer
+    VpcConfig:
+      SecurityGroupIds:
+        - !Ref LambdaSecurityGroup
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+
+# =============================================================================
+# RESOURCES
+# =============================================================================
+Resources:
+
+  # --------------------------------------------------------------------------
+  # NETWORKING — VPC, Subnets, Security Groups
+  # --------------------------------------------------------------------------
+  StudentPortalVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub student-portal-vpc-${Environment}
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref StudentPortalVPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref StudentPortalVPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref StudentPortalVPC
+      CidrBlock: 10.0.11.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref StudentPortalVPC
+      CidrBlock: 10.0.12.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for Lambda functions
+      VpcId: !Ref StudentPortalVPC
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+
+  RDSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for RDS PostgreSQL
+      VpcId: !Ref StudentPortalVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref LambdaSecurityGroup
+
+  # --------------------------------------------------------------------------
+  # COGNITO — User Pool and App Client
+  # --------------------------------------------------------------------------
+  CognitoUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub student-portal-pool-${Environment}
+      UsernameAttributes: [email]
+      AutoVerifiedAttributes: [email]
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Mutable: false
+          Required: true
+        - Name: name
+          AttributeDataType: String
+          Mutable: true
+          Required: true
+      EmailConfiguration:
+        EmailSendingAccount: COGNITO_DEFAULT
+        From: !Ref CognitoFromEmail
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - Name: verified_email
+            Priority: 1
+
+  CognitoUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub student-portal-client-${Environment}
+      UserPoolId: !Ref CognitoUserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+        - ALLOW_USER_SRP_AUTH
+      PreventUserExistenceErrors: ENABLED
+      TokenValidityUnits:
+        AccessToken: hours
+        IdToken: hours
+        RefreshToken: days
+      AccessTokenValidity: 1
+      IdTokenValidity: 1
+      RefreshTokenValidity: 30
+
+  # --------------------------------------------------------------------------
+  # LAMBDA LAYER — psycopg2 binary for PostgreSQL
+  # --------------------------------------------------------------------------
+  PsycopgLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: !Sub psycopg2-layer-${Environment}
+      Description: psycopg2-binary for PostgreSQL connectivity
+      ContentUri: backend/layers/psycopg2/
+      CompatibleRuntimes: [python3.12]
+      CompatibleArchitectures: [arm64]
+    Metadata:
+      BuildMethod: python3.12
+
+  # --------------------------------------------------------------------------
+  # LAMBDA FUNCTIONS
+  # --------------------------------------------------------------------------
+  AuthFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub student-portal-auth-${Environment}
+      CodeUri: backend/
+      Handler: handlers.auth_handler.lambda_handler
+      Description: "Handles Cognito registration and login"
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - Statement:
+            Effect: Allow
+            Action:
+              - cognito-idp:SignUp
+              - cognito-idp:InitiateAuth
+              - cognito-idp:ConfirmSignUp
+            Resource: !GetAtt CognitoUserPool.Arn
+      Events:
+        AuthPost:
+          Type: Api
+          Properties:
+            RestApiId: !Ref StudentPortalAPI
+            Path: /auth
+            Method: POST
+
+  StudentFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub student-portal-student-${Environment}
+      CodeUri: backend/
+      Handler: handlers.student_handler.lambda_handler
+      Description: "Handles student profile CRUD via stored procedures"
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - AWSLambdaVPCAccessExecutionRole
+      Events:
+        StudentPost:
+          Type: Api
+          Properties:
+            RestApiId: !Ref StudentPortalAPI
+            Path: /students
+            Method: POST
+            Auth:
+              Authorizer: CognitoAuthorizer
+        StudentGet:
+          Type: Api
+          Properties:
+            RestApiId: !Ref StudentPortalAPI
+            Path: /students/me
+            Method: GET
+            Auth:
+              Authorizer: CognitoAuthorizer
+        StudentPut:
+          Type: Api
+          Properties:
+            RestApiId: !Ref StudentPortalAPI
+            Path: /students/me
+            Method: PUT
+            Auth:
+              Authorizer: CognitoAuthorizer
+
+  # --------------------------------------------------------------------------
+  # API GATEWAY
+  # --------------------------------------------------------------------------
+  StudentPortalAPI:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub student-portal-api-${Environment}
+      StageName: !Ref Environment
+      Cors:
+        AllowMethods: "'GET,POST,PUT,DELETE,OPTIONS'"
+        AllowHeaders: "'Content-Type,Authorization'"
+        AllowOrigin: "'*'"
+      Auth:
+        Authorizers:
+          CognitoAuthorizer:
+            UserPoolArn: !GetAtt CognitoUserPool.Arn
+            Identity:
+              Header: Authorization
+
+  # --------------------------------------------------------------------------
+  # RDS POSTGRESQL
+  # --------------------------------------------------------------------------
+  RDSSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Subnet group for Student Portal RDS
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+
+  RDSInstance:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
+    Properties:
+      DBInstanceIdentifier: !Sub student-portal-db-${Environment}
+      DBName: studentportal
+      DBInstanceClass: db.t4g.micro
+      Engine: postgres
+      EngineVersion: "15.4"
+      MasterUsername: !Ref DBUsername
+      MasterUserPassword: !Ref DBPassword
+      AllocatedStorage: "20"
+      StorageType: gp3
+      StorageEncrypted: true
+      MultiAZ: false
+      PubliclyAccessible: false
+      DBSubnetGroupName: !Ref RDSSubnetGroup
+      VPCSecurityGroups:
+        - !Ref RDSSecurityGroup
+      BackupRetentionPeriod: 7
+      DeletionProtection: false
+
+  # --------------------------------------------------------------------------
+  # DYNAMODB — Session / Cache Table
+  # --------------------------------------------------------------------------
+  SessionTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub student-portal-sessions-${Environment}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: session_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: session_id
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  # --------------------------------------------------------------------------
+  # S3 BUCKETS — Frontend app + Profile images
+  # --------------------------------------------------------------------------
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub student-portal-frontend-${Environment}-${AWS::AccountId}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub arn:aws:s3:::${FrontendBucket}/*
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}
+
+  ProfileImagesBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub student-portal-profiles-${Environment}-${AWS::AccountId}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders: ["*"]
+            AllowedMethods: [GET, PUT, POST]
+            AllowedOrigins: ["*"]
+            MaxAge: 3000
+
+  # --------------------------------------------------------------------------
+  # CLOUDFRONT — CDN for the Next.js Static Export
+  # --------------------------------------------------------------------------
+  CloudFrontOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub student-portal-oac-${Environment}
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub Student Portal CDN (${Environment})
+        DefaultRootObject: index.html
+        HttpVersion: http2and3
+        Origins:
+          - Id: S3Origin
+            DomainName: !GetAtt FrontendBucket.RegionalDomainName
+            S3OriginConfig: {}
+            OriginAccessControlId: !Ref CloudFrontOAC
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6  # Managed-CachingOptimized
+          Compress: true
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+
+# =============================================================================
+# OUTPUTS
+# =============================================================================
+Outputs:
+  APIEndpoint:
+    Description: "API Gateway endpoint URL"
+    Value: !Sub "https://${StudentPortalAPI}.execute-api.${AWS::Region}.amazonaws.com/${Environment}"
+    Export:
+      Name: !Sub StudentPortalAPIEndpoint-${Environment}
+
+  CloudFrontURL:
+    Description: "CloudFront distribution URL"
+    Value: !Sub "https://${CloudFrontDistribution.DomainName}"
+    Export:
+      Name: !Sub StudentPortalCloudfrontURL-${Environment}
+
+  CognitoUserPoolId:
+    Description: "Cognito User Pool ID"
+    Value: !Ref CognitoUserPool
+    Export:
+      Name: !Sub StudentPortalUserPoolId-${Environment}
+
+  CognitoClientId:
+    Description: "Cognito App Client ID"
+    Value: !Ref CognitoUserPoolClient
+    Export:
+      Name: !Sub StudentPortalClientId-${Environment}
+
+  FrontendBucketName:
+    Description: "S3 bucket for the Next.js frontend"
+    Value: !Ref FrontendBucket
+    Export:
+      Name: !Sub StudentPortalFrontendBucket-${Environment}
+
+  RDSEndpoint:
+    Description: "RDS PostgreSQL endpoint"
+    Value: !GetAtt RDSInstance.Endpoint.Address
+    Export:
+      Name: !Sub StudentPortalDBEndpoint-${Environment}

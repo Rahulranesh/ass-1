@@ -1,0 +1,160 @@
+name: Deploy Backend to AWS (SAM)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "backend/**"
+      - "infrastructure/**"
+      - ".github/workflows/deploy-backend.yml"
+
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Deployment environment"
+        required: true
+        default: dev
+        type: choice
+        options: [dev, staging, prod]
+
+env:
+  AWS_REGION: us-east-1
+  SAM_CLI_TELEMETRY: 0
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Job 1: Test and Lint Python
+  # ---------------------------------------------------------------------------
+  test:
+    name: Test Python Backend
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install test dependencies
+        working-directory: backend
+        run: |
+          pip install pytest pytest-cov pylint
+          pip install -r requirements.txt
+
+      - name: Run linting (pylint)
+        working-directory: backend
+        run: pylint handlers/ models/ db/ utils/ --fail-under=8.0
+
+      - name: Run unit tests
+        working-directory: backend
+        run: |
+          pytest tests/ -v \
+            --cov=. \
+            --cov-report=xml \
+            --cov-report=term-missing \
+            --cov-fail-under=70
+
+      - name: Upload coverage report
+        uses: codecov/codecov-action@v4
+        with:
+          file: backend/coverage.xml
+          fail_ci_if_error: false
+
+  # ---------------------------------------------------------------------------
+  # Job 2: SAM Build + Deploy
+  # ---------------------------------------------------------------------------
+  deploy:
+    name: SAM Deploy to AWS
+    runs-on: ubuntu-latest
+    needs: test
+    environment:
+      name: ${{ github.event.inputs.environment || 'dev' }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Set up AWS SAM CLI
+        uses: aws-actions/setup-sam@v2
+        with:
+          use-installer: true
+
+      - name: SAM Build
+        working-directory: infrastructure
+        run: sam build --use-container --template template.yaml
+
+      - name: SAM Deploy
+        working-directory: infrastructure
+        env:
+          ENVIRONMENT: ${{ github.event.inputs.environment || 'dev' }}
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+        run: |
+          sam deploy \
+            --no-confirm-changeset \
+            --no-fail-on-empty-changeset \
+            --stack-name student-portal-${ENVIRONMENT} \
+            --s3-bucket ${{ secrets.SAM_DEPLOYMENT_BUCKET }} \
+            --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM \
+            --parameter-overrides \
+              Environment=${ENVIRONMENT} \
+              DBPassword=${DB_PASSWORD} \
+            --region ${{ env.AWS_REGION }}
+
+      - name: Run DB Migrations
+        env:
+          DB_HOST: ${{ secrets.DB_HOST }}
+          DB_PORT: "5432"
+          DB_NAME: studentportal
+          DB_USER: ${{ secrets.DB_USERNAME }}
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+        run: |
+          pip install psycopg2-binary
+          python - << 'EOF'
+          import psycopg2, os
+
+          conn = psycopg2.connect(
+              host=os.environ['DB_HOST'],
+              port=os.environ['DB_PORT'],
+              dbname=os.environ['DB_NAME'],
+              user=os.environ['DB_USER'],
+              password=os.environ['DB_PASSWORD'],
+              sslmode='require'
+          )
+          cur = conn.cursor()
+
+          sql_files = ['schema.sql', 'procedures.sql', 'triggers.sql']
+          for sql_file in sql_files:
+              print(f"Running {sql_file}...")
+              with open(f'infrastructure/sql/{sql_file}', 'r') as f:
+                  cur.execute(f.read())
+              conn.commit()
+              print(f"  ✓ {sql_file} executed successfully")
+
+          cur.close()
+          conn.close()
+          print("All migrations complete!")
+          EOF
+
+      - name: Deployment summary
+        run: |
+          echo "## 🚀 Backend Deployed!" >> $GITHUB_STEP_SUMMARY
+          echo "- **Environment**: ${{ github.event.inputs.environment || 'dev' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Commit**: ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Stack**: student-portal-${{ github.event.inputs.environment || 'dev' }}" >> $GITHUB_STEP_SUMMARY

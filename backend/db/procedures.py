@@ -1,15 +1,10 @@
 """
-procedures.py
--------------
-Thin wrappers around PostgreSQL stored procedures.
+procedures.py (updated for Render deployment)
+----------------------------------------------
+Adds register_user() and get_user_by_email() for JWT-based auth
+(replaces Cognito when running on Render).
 
-All database writes and reads go through stored procedures (not raw SQL)
-to satisfy the assignment requirement (#6).
-
-OOP Concepts Demonstrated:
-  - ENCAPSULATION: SQL details hidden inside StoredProcedureRepository.
-  - ABSTRACTION: Callers use insert_student() and get_student() without
-    knowing the SQL or stored procedure names.
+All student methods remain unchanged.
 """
 
 import logging
@@ -23,14 +18,14 @@ logger = logging.getLogger(__name__)
 class StoredProcedureRepository:
     """
     Repository that invokes PostgreSQL stored procedures for all
-    student-related database operations.
+    student-related and auth database operations.
 
     Encapsulation:
       - The DatabaseConnection instance is a private dependency.
       - Stored procedure names are private constants.
 
     Abstraction:
-      - Public methods have semantic names (insert_student, get_student_by_sub).
+      - Public methods have semantic names.
     """
 
     # Private stored procedure names (Encapsulation)
@@ -38,13 +33,44 @@ class StoredProcedureRepository:
     __SP_GET_BY_SUB = "get_student_by_cognito_sub"
     __SP_LIST_ALL = "list_all_students"
     __SP_UPDATE_STUDENT = "update_student_profile"
+    __SP_REGISTER_USER = "register_user"
+    __SP_GET_USER_BY_EMAIL = "get_user_by_email"
 
     def __init__(self, db: DatabaseConnection):
         # Dependency injection — allows easy mocking in tests
         self.__db = db
 
     # ------------------------------------------------------------------ #
-    #  PUBLIC METHODS (Abstraction)                                       #
+    #  AUTH METHODS                                                        #
+    # ------------------------------------------------------------------ #
+
+    def register_user(self, email: str, full_name: str, pw_hash: str) -> Dict[str, Any]:
+        """
+        Register a new user via the `register_user` stored procedure.
+        Returns the new user_id.
+        """
+        logger.info("Calling stored procedure: %s", self.__SP_REGISTER_USER)
+        with self.__db.get_cursor() as cur:
+            cur.callproc(self.__SP_REGISTER_USER, [email, full_name, pw_hash])
+            result = cur.fetchone()
+        user_id = result["user_id"] if result else None
+        return {"user_id": str(user_id) if user_id else None}
+
+    def get_user_by_email(self, email: str) -> Optional[Dict[str, Any]]:
+        """
+        Retrieve a user record by email for login verification.
+        Returns dict with user_id, email, full_name, password_hash or None.
+        """
+        logger.info("Calling stored procedure: %s", self.__SP_GET_USER_BY_EMAIL)
+        with self.__db.get_cursor() as cur:
+            cur.callproc(self.__SP_GET_USER_BY_EMAIL, [email])
+            result = cur.fetchone()
+        if result is None:
+            return None
+        return dict(result)
+
+    # ------------------------------------------------------------------ #
+    #  STUDENT PROFILE METHODS                                            #
     # ------------------------------------------------------------------ #
 
     def insert_student(
@@ -59,23 +85,7 @@ class StoredProcedureRepository:
     ) -> Dict[str, Any]:
         """
         Insert a new student by calling the `insert_student` stored procedure.
-
-        The procedure returns the newly created student_id (UUID).
-
-        Args:
-            cognito_sub: Cognito user UUID.
-            email: Student email address.
-            full_name: Full display name.
-            school: School name.
-            grade: Grade level.
-            gpa: GPA (0.00–4.00).
-            career_interest: Selected career interest.
-
-        Returns:
-            Dict with the new student_id.
-
-        Raises:
-            RuntimeError: If the procedure raises a DB error.
+        Returns dict with the new student_id.
         """
         args = [cognito_sub, email, full_name, school, grade, gpa, career_interest]
         logger.info("Calling stored procedure: %s", self.__SP_INSERT_STUDENT)
@@ -90,14 +100,8 @@ class StoredProcedureRepository:
 
     def get_student_by_sub(self, cognito_sub: str) -> Optional[Dict[str, Any]]:
         """
-        Retrieve a student profile by Cognito sub by calling
-        `get_student_by_cognito_sub` stored procedure.
-
-        Args:
-            cognito_sub: The Cognito user UUID.
-
-        Returns:
-            A dict of student fields, or None if not found.
+        Retrieve a student profile by user ID (cognito_sub).
+        Returns a dict of student fields, or None if not found.
         """
         logger.info("Calling stored procedure: %s", self.__SP_GET_BY_SUB)
 
@@ -112,12 +116,7 @@ class StoredProcedureRepository:
         return dict(result)
 
     def list_all_students(self) -> List[Dict[str, Any]]:
-        """
-        List all students (admin use only) via `list_all_students` stored proc.
-
-        Returns:
-            List of student dicts.
-        """
+        """List all students (admin use only)."""
         logger.info("Calling stored procedure: %s", self.__SP_LIST_ALL)
 
         with self.__db.get_cursor() as cur:
@@ -135,10 +134,8 @@ class StoredProcedureRepository:
         career_interest: str,
     ) -> bool:
         """
-        Update an existing student's profile via `update_student_profile` proc.
-
-        Returns:
-            True if the record was found and updated, False otherwise.
+        Update an existing student's profile.
+        Returns True if the record was updated.
         """
         args = [cognito_sub, school, grade, gpa, career_interest]
         logger.info("Calling stored procedure: %s", self.__SP_UPDATE_STUDENT)

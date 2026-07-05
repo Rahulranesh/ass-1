@@ -1,0 +1,141 @@
+name: Deploy Frontend to S3 + CloudFront
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "frontend/**"
+      - ".github/workflows/deploy-frontend.yml"
+
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Deployment environment"
+        required: true
+        default: dev
+        type: choice
+        options: [dev, staging, prod]
+
+env:
+  NODE_VERSION: "20"
+  AWS_REGION: us-east-1
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Job 1: Build the Next.js app
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build Next.js App
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Write environment variables
+        working-directory: frontend
+        env:
+          NEXT_PUBLIC_API_URL: ${{ secrets.API_GATEWAY_URL }}
+          NEXT_PUBLIC_COGNITO_USER_POOL_ID: ${{ secrets.COGNITO_USER_POOL_ID }}
+          NEXT_PUBLIC_COGNITO_CLIENT_ID: ${{ secrets.COGNITO_CLIENT_ID }}
+          NEXT_PUBLIC_AWS_REGION: ${{ env.AWS_REGION }}
+        run: |
+          cat > .env.production << EOF
+          NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL}
+          NEXT_PUBLIC_COGNITO_USER_POOL_ID=${NEXT_PUBLIC_COGNITO_USER_POOL_ID}
+          NEXT_PUBLIC_COGNITO_CLIENT_ID=${NEXT_PUBLIC_COGNITO_CLIENT_ID}
+          NEXT_PUBLIC_AWS_REGION=${NEXT_PUBLIC_AWS_REGION}
+          EOF
+
+      - name: Run ESLint
+        working-directory: frontend
+        run: npm run lint
+
+      - name: Build for static export
+        working-directory: frontend
+        run: npm run build
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nextjs-build
+          path: frontend/out/
+          retention-days: 1
+
+  # ---------------------------------------------------------------------------
+  # Job 2: Deploy to S3 and invalidate CloudFront
+  # ---------------------------------------------------------------------------
+  deploy:
+    name: Deploy to AWS
+    runs-on: ubuntu-latest
+    needs: build
+    environment:
+      name: ${{ github.event.inputs.environment || 'dev' }}
+      url: ${{ steps.cloudfront.outputs.url }}
+
+    steps:
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: nextjs-build
+          path: out/
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Sync to S3
+        env:
+          S3_BUCKET: ${{ secrets.FRONTEND_S3_BUCKET }}
+        run: |
+          # Sync with cache headers:
+          # - HTML files: no-cache (always fresh)
+          # - _next/static: long cache (content-addressed filenames)
+          aws s3 sync out/ s3://${S3_BUCKET}/ \
+            --delete \
+            --exclude "_next/static/*" \
+            --cache-control "no-cache, no-store, must-revalidate"
+
+          aws s3 sync out/_next/static/ s3://${S3_BUCKET}/_next/static/ \
+            --cache-control "public, max-age=31536000, immutable"
+
+      - name: Invalidate CloudFront cache
+        id: cloudfront
+        env:
+          CLOUDFRONT_DISTRIBUTION_ID: ${{ secrets.CLOUDFRONT_DISTRIBUTION_ID }}
+        run: |
+          INVALIDATION_ID=$(aws cloudfront create-invalidation \
+            --distribution-id ${CLOUDFRONT_DISTRIBUTION_ID} \
+            --paths "/*" \
+            --query 'Invalidation.Id' \
+            --output text)
+
+          echo "CloudFront invalidation created: ${INVALIDATION_ID}"
+
+          # Get the CloudFront domain for environment URL
+          DOMAIN=$(aws cloudfront get-distribution \
+            --id ${CLOUDFRONT_DISTRIBUTION_ID} \
+            --query 'Distribution.DomainName' \
+            --output text)
+          echo "url=https://${DOMAIN}" >> $GITHUB_OUTPUT
+
+      - name: Deployment summary
+        run: |
+          echo "## 🚀 Frontend Deployed!" >> $GITHUB_STEP_SUMMARY
+          echo "- **Environment**: ${{ github.event.inputs.environment || 'dev' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Commit**: ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **URL**: ${{ steps.cloudfront.outputs.url }}" >> $GITHUB_STEP_SUMMARY
