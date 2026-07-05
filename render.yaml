@@ -14,6 +14,8 @@ services:
     envVars:
       - key: PYTHONUNBUFFERED
         value: "1"
+      - key: PYTHON_VERSION
+        value: 3.12.8
       - key: JWT_SECRET
         generateValue: true        # Render auto-generates a secure random value
       - key: JWT_EXPIRY_HOURS
