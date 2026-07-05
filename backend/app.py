@@ -373,6 +373,68 @@ async def update_student(
     return {"message": "Profile updated successfully."}
 
 
+@app.get("/debug-db", summary="Debug DB connection", tags=["System"])
+def debug_db():
+    import os
+    import traceback
+    import psycopg2
+    
+    db_keys = {
+        "DATABASE_URL": "SET (masked)" if os.environ.get("DATABASE_URL") else "MISSING",
+        "DB_HOST": os.environ.get("DB_HOST", "MISSING"),
+        "DB_PORT": os.environ.get("DB_PORT", "MISSING"),
+        "DB_NAME": os.environ.get("DB_NAME", "MISSING"),
+        "DB_USER": os.environ.get("DB_USER", "MISSING"),
+        "DB_PASSWORD": "SET (masked)" if os.environ.get("DB_PASSWORD") else "MISSING"
+    }
+    
+    database_url = os.environ.get("DATABASE_URL")
+    error_msg = None
+    tb = None
+    connection_status = "Not attempted"
+    
+    try:
+        if database_url:
+            dsn = database_url.replace("postgres://", "postgresql://", 1)
+            if "sslmode" not in dsn:
+                if "?" in dsn:
+                    dsn += "&sslmode=require"
+                else:
+                    dsn += "?sslmode=require"
+            conn = psycopg2.connect(dsn)
+            conn.close()
+            connection_status = "Success connecting with DATABASE_URL"
+        else:
+            # Try individual env vars
+            required = ["DB_HOST", "DB_PORT", "DB_NAME", "DB_USER", "DB_PASSWORD"]
+            missing = [v for v in required if not os.environ.get(v)]
+            if missing:
+                connection_status = f"DATABASE_URL not set, and missing individual vars: {missing}"
+            else:
+                dsn = (
+                    f"host={os.environ['DB_HOST']} "
+                    f"port={os.environ['DB_PORT']} "
+                    f"dbname={os.environ['DB_NAME']} "
+                    f"user={os.environ['DB_USER']} "
+                    f"password={os.environ['DB_PASSWORD']} "
+                    f"sslmode=require"
+                )
+                conn = psycopg2.connect(dsn)
+                conn.close()
+                connection_status = "Success connecting with individual environment variables"
+    except Exception as e:
+        connection_status = "Failed connecting"
+        error_msg = str(e)
+        tb = traceback.format_exc()
+        
+    return {
+        "env_vars_present": db_keys,
+        "connection_status": connection_status,
+        "error": error_msg,
+        "traceback": tb
+    }
+
+
 # ── Health check ────────────────────────────────────────────────────────────
 
 @app.get("/health", summary="Health check", tags=["System"])
