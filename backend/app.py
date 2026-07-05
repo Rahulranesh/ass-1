@@ -1,70 +1,84 @@
 """
-app.py — Flask API Server for Render Deployment
--------------------------------------------------
-Wraps the Lambda-style handlers into standard Flask HTTP routes.
+app.py — FastAPI server for Render deployment
+----------------------------------------------
+Wraps the OOP handlers into standard FastAPI HTTP routes.
 
-Auth uses JWT tokens issued by our own auth system (no AWS Cognito needed).
-Instead of Cognito, we use PyJWT + bcrypt for register/login.
-The StudentHandler uses PostgreSQL directly — same stored procedures.
+Auth uses PyJWT + bcrypt (replaces AWS Cognito on Render).
+All student operations call PostgreSQL stored procedures via
+StoredProcedureRepository — same as the Lambda version.
 
 Routes:
-  POST   /auth              → register / login / confirm (no-auth)
+  POST   /auth              → register / login (no auth)
   POST   /students          → create profile (JWT required)
   GET    /students/me       → get own profile (JWT required)
   PUT    /students/me       → update profile (JWT required)
   GET    /health            → health check
+  GET    /docs              → auto-generated Swagger UI (FastAPI)
 """
 
-import json
 import logging
 import os
 import sys
 from datetime import datetime, timedelta, timezone
-from functools import wraps
+from typing import Any, Dict, Optional
 
 import bcrypt
 import jwt as pyjwt
-from flask import Flask, jsonify, request
-from flask_cors import CORS
+from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from pydantic import BaseModel, EmailStr, Field, field_validator
 
-# Add the backend directory itself to the Python path
+# ── Python path fix so backend/* imports work ─────────────────────────────
 sys.path.insert(0, os.path.dirname(__file__))
 
 from db.connection import DatabaseConnection
 from db.procedures import StoredProcedureRepository
-from models.student_model import StudentModel, GRADE_OPTIONS, CAREER_INTERESTS
-from models.undergraduate import UndergraduateStudent, UNDERGRAD_GRADE_OPTIONS
+from models.student_model import CAREER_INTERESTS, GRADE_OPTIONS, StudentModel
 from models.graduate import GraduateStudent, GRAD_GRADE_OPTIONS
+from models.undergraduate import UndergraduateStudent, UNDERGRAD_GRADE_OPTIONS
 
-# ---------------------------------------------------------------------------
-# App setup
-# ---------------------------------------------------------------------------
+# ── Logging ───────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = Flask(__name__)
-CORS(app, origins="*", supports_credentials=True)
-
+# ── Config ────────────────────────────────────────────────────────────────
 JWT_SECRET = os.environ.get("JWT_SECRET", "change-this-in-production-secret-key")
 JWT_ALGO = "HS256"
 JWT_EXPIRY_HOURS = int(os.environ.get("JWT_EXPIRY_HOURS", "24"))
 
-# ---------------------------------------------------------------------------
-# DB singletons (reused across requests — connection pooling)
-# ---------------------------------------------------------------------------
-_db = None
-_repo = None
+# ── FastAPI app ────────────────────────────────────────────────────────────
+app = FastAPI(
+    title="Student Portal API",
+    description="Full-stack student registration and profile API (OOP · Python · PostgreSQL)",
+    version="1.0.0",
+    docs_url="/docs",        # Swagger UI at /docs
+    redoc_url="/redoc",      # ReDoc at /redoc
+)
 
-def get_db():
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],          # Restrict to your frontend domain in prod
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ── DB singletons (connection pool reused across requests) ─────────────────
+_db: Optional[DatabaseConnection] = None
+_repo: Optional[StoredProcedureRepository] = None
+
+
+def get_repo() -> StoredProcedureRepository:
+    """Dependency injection: lazily initialise DB pool."""
     global _db, _repo
     if _db is None:
         _db = DatabaseConnection()
         _repo = StoredProcedureRepository(_db)
-    return _db, _repo
+    return _repo
 
-# ---------------------------------------------------------------------------
-# JWT helpers
-# ---------------------------------------------------------------------------
+
+# ── JWT helpers ────────────────────────────────────────────────────────────
 
 def create_token(user_id: str, email: str) -> str:
     """Issue a signed JWT access token."""
@@ -78,147 +92,198 @@ def create_token(user_id: str, email: str) -> str:
 
 
 def decode_token(token: str) -> dict:
-    """Decode and validate a JWT. Raises if expired/invalid."""
+    """Decode and validate a JWT. Raises ValueError on failure."""
     return pyjwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGO])
 
 
-def jwt_required(f):
-    """Decorator: protects a route with JWT auth."""
-    @wraps(f)
-    def decorated(*args, **kwargs):
-        auth_header = request.headers.get("Authorization", "")
-        if not auth_header.startswith("Bearer "):
-            return jsonify({"error": "Missing or invalid Authorization header"}), 401
-        token = auth_header.split(" ", 1)[1]
-        try:
-            payload = decode_token(token)
-        except pyjwt.ExpiredSignatureError:
-            return jsonify({"error": "Token has expired"}), 401
-        except pyjwt.InvalidTokenError as exc:
-            return jsonify({"error": f"Invalid token: {exc}"}), 401
-        request.user = payload
-        return f(*args, **kwargs)
-    return decorated
+_bearer = HTTPBearer(auto_error=False)
 
-# ---------------------------------------------------------------------------
-# Auth routes — no JWT needed
-# ---------------------------------------------------------------------------
 
-@app.route("/auth", methods=["POST"])
-def auth():
+def get_current_user(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(_bearer),
+) -> dict:
+    """
+    FastAPI dependency — validates the Bearer JWT and returns the payload.
+    Raises HTTP 401 if the token is missing or invalid.
+    """
+    if not credentials or not credentials.credentials:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing Authorization header",
+        )
+    try:
+        return decode_token(credentials.credentials)
+    except pyjwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token has expired")
+    except pyjwt.InvalidTokenError as exc:
+        raise HTTPException(status_code=401, detail=f"Invalid token: {exc}")
+
+
+# ── Pydantic request / response models ────────────────────────────────────
+
+class AuthRequest(BaseModel):
+    action: str = Field(..., examples=["register", "login"])
+    email: str = Field(..., examples=["student@university.edu"])
+    password: str = Field(..., min_length=8)
+    full_name: Optional[str] = Field(None, examples=["Jane Smith"])
+    confirmation_code: Optional[str] = None
+
+    @field_validator("email")
+    @classmethod
+    def validate_email(cls, v: str) -> str:
+        v = v.strip().lower()
+        if "@" not in v or "." not in v.split("@")[-1]:
+            raise ValueError("Invalid email format")
+        return v
+
+
+class StudentCreateRequest(BaseModel):
+    full_name: str = Field(..., min_length=1, examples=["Jane Smith"])
+    school: str = Field(..., min_length=1, examples=["MIT"])
+    grade: str = Field(..., examples=["Freshman (Year 1)"])
+    gpa: float = Field(..., ge=0.0, le=4.0, examples=[3.8])
+    career_interest: str = Field(..., examples=["Software Engineering"])
+    major: Optional[str] = None
+    thesis_topic: Optional[str] = None
+    advisor_name: Optional[str] = None
+
+    @field_validator("grade")
+    @classmethod
+    def validate_grade(cls, v: str) -> str:
+        if v not in GRADE_OPTIONS:
+            raise ValueError(f"grade must be one of: {GRADE_OPTIONS}")
+        return v
+
+    @field_validator("career_interest")
+    @classmethod
+    def validate_career(cls, v: str) -> str:
+        if v not in CAREER_INTERESTS:
+            raise ValueError(f"career_interest must be one of: {CAREER_INTERESTS}")
+        return v
+
+
+class StudentUpdateRequest(BaseModel):
+    school: str = Field(..., min_length=1)
+    grade: str
+    gpa: float = Field(..., ge=0.0, le=4.0)
+    career_interest: str
+
+
+# ── Auth routes ────────────────────────────────────────────────────────────
+
+@app.post(
+    "/auth",
+    summary="Register or Login",
+    tags=["Auth"],
+    responses={
+        200: {"description": "Login successful"},
+        201: {"description": "Registration successful"},
+        400: {"description": "Validation error"},
+        401: {"description": "Invalid credentials"},
+        409: {"description": "Email already exists"},
+    },
+)
+async def auth(body: AuthRequest, repo: StoredProcedureRepository = Depends(get_repo)):
     """
     Unified auth endpoint.
-    Body must have { "action": "register"|"login" }
+
+    - **action = "register"** → creates a new account
+    - **action = "login"** → returns a JWT access token
+    - **action = "confirm"** → no-op (no email confirmation on Render)
     """
-    body = request.get_json(force=True, silent=True) or {}
-    action = body.get("action", "").lower()
-    email = (body.get("email") or "").strip().lower()
-    password = body.get("password", "")
-    full_name = (body.get("full_name") or "").strip()
-
-    # Basic validation
-    if not email or "@" not in email:
-        return jsonify({"error": "Valid email is required"}), 400
-    if action in ("register", "login") and len(password) < 8:
-        return jsonify({"error": "Password must be at least 8 characters"}), 400
-
-    _, repo = get_db()
+    action = body.action.lower()
 
     if action == "register":
-        if not full_name:
-            return jsonify({"error": "full_name is required for registration"}), 400
-        # Hash password
-        pw_hash = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+        if not body.full_name or not body.full_name.strip():
+            raise HTTPException(400, "full_name is required for registration")
+        pw_hash = bcrypt.hashpw(body.password.encode(), bcrypt.gensalt()).decode()
         try:
-            result = repo.register_user(email=email, full_name=full_name, pw_hash=pw_hash)
+            result = repo.register_user(
+                email=body.email,
+                full_name=body.full_name.strip(),
+                pw_hash=pw_hash,
+            )
         except Exception as exc:
+            err = str(exc).lower()
+            if "unique" in err or "duplicate" in err:
+                raise HTTPException(409, "An account with this email already exists")
             logger.error("Register error: %s", exc)
-            err_msg = str(exc)
-            if "unique" in err_msg.lower() or "duplicate" in err_msg.lower():
-                return jsonify({"error": "An account with this email already exists"}), 409
-            return jsonify({"error": "Registration failed. Please try again."}), 500
-        return jsonify({
+            raise HTTPException(500, "Registration failed. Please try again.")
+
+        return {
             "message": "Registration successful! You can now log in.",
             "user_id": result.get("user_id"),
-        }), 201
+        }
 
     elif action == "login":
         try:
-            user = repo.get_user_by_email(email)
+            user = repo.get_user_by_email(body.email)
         except Exception as exc:
             logger.error("Login DB error: %s", exc)
-            return jsonify({"error": "Login failed. Please try again."}), 500
+            raise HTTPException(500, "Login failed. Please try again.")
 
-        if not user:
-            return jsonify({"error": "Invalid email or password"}), 401
+        if not user or not bcrypt.checkpw(
+            body.password.encode(), user["password_hash"].encode()
+        ):
+            raise HTTPException(401, "Invalid email or password")
 
-        # Verify password
-        if not bcrypt.checkpw(password.encode(), user["password_hash"].encode()):
-            return jsonify({"error": "Invalid email or password"}), 401
-
-        token = create_token(user_id=str(user["user_id"]), email=email)
-        return jsonify({
+        token = create_token(user_id=str(user["user_id"]), email=body.email)
+        return {
             "access_token": token,
-            "id_token": token,         # same token — frontend stores both
-            "refresh_token": token,    # simplified (no refresh flow needed for demo)
+            "id_token": token,
+            "refresh_token": token,
             "expires_in": JWT_EXPIRY_HOURS * 3600,
             "message": "Login successful.",
-            "user": {"email": email, "full_name": user.get("full_name", "")},
-        }), 200
+            "user": {"email": body.email, "full_name": user.get("full_name", "")},
+        }
 
     elif action == "confirm":
-        # No email confirmation needed — accounts are auto-confirmed
-        return jsonify({"message": "Account is already confirmed. Please log in."}), 200
+        return {"message": "Account is already confirmed. Please log in."}
 
     else:
-        return jsonify({"error": f"Unknown action '{action}'. Use: register, login"}), 400
+        raise HTTPException(400, f"Unknown action '{action}'. Use: register, login")
 
 
-# ---------------------------------------------------------------------------
-# Student profile routes — JWT required
-# ---------------------------------------------------------------------------
+# ── Student profile routes ─────────────────────────────────────────────────
 
-@app.route("/students", methods=["POST"])
-@jwt_required
-def create_student():
-    """Create a student profile for the logged-in user."""
-    body = request.get_json(force=True, silent=True) or {}
-    cognito_sub = request.user["sub"]
-    email = request.user.get("email", body.get("email", ""))
-    body["cognito_sub"] = cognito_sub
-    body["email"] = email
+@app.post(
+    "/students",
+    status_code=201,
+    summary="Create student profile",
+    tags=["Students"],
+)
+async def create_student(
+    body: StudentCreateRequest,
+    current_user: dict = Depends(get_current_user),
+    repo: StoredProcedureRepository = Depends(get_repo),
+):
+    """
+    Create a student profile for the logged-in user.
 
-    # Required fields check
-    required = ["full_name", "school", "grade", "gpa", "career_interest"]
-    for field in required:
-        if not body.get(field):
-            return jsonify({"error": f"Field '{field}' is required"}), 400
+    Requires **Bearer JWT** in the Authorization header.
+    Automatically selects the correct model subclass
+    (GraduateStudent / UndergraduateStudent / StudentModel) based on grade.
+    """
+    cognito_sub = current_user["sub"]
+    email = current_user.get("email", "")
 
-    try:
-        gpa = float(body["gpa"])
-        if not (0.0 <= gpa <= 4.0):
-            return jsonify({"error": "GPA must be between 0.0 and 4.0"}), 400
-    except (TypeError, ValueError):
-        return jsonify({"error": "GPA must be a valid number"}), 400
+    data = {
+        **body.model_dump(),
+        "cognito_sub": cognito_sub,
+        "email": email,
+    }
 
-    if body.get("grade") not in GRADE_OPTIONS:
-        return jsonify({"error": f"Invalid grade. Choose from: {GRADE_OPTIONS}"}), 400
-
-    if body.get("career_interest") not in CAREER_INTERESTS:
-        return jsonify({"error": f"Invalid career interest"}), 400
-
-    grade = body.get("grade", "")
+    grade = body.grade
     try:
         if grade in GRAD_GRADE_OPTIONS:
-            student = GraduateStudent.from_dict(body)
+            student = GraduateStudent.from_dict(data)
         elif grade in UNDERGRAD_GRADE_OPTIONS:
-            student = UndergraduateStudent.from_dict(body)
+            student = UndergraduateStudent.from_dict(data)
         else:
-            student = StudentModel.from_dict(body)
+            student = StudentModel.from_dict(data)
     except ValueError as exc:
-        return jsonify({"error": str(exc)}), 400
+        raise HTTPException(400, str(exc))
 
-    _, repo = get_db()
     try:
         result = repo.insert_student(
             cognito_sub=student.cognito_sub,
@@ -230,30 +295,39 @@ def create_student():
             career_interest=student.career_interest,
         )
     except Exception as exc:
+        err = str(exc).lower()
+        if "unique" in err or "duplicate" in err:
+            raise HTTPException(409, "Profile already exists. Use PUT /students/me to update.")
         logger.error("Insert student error: %s", exc)
-        err_msg = str(exc)
-        if "unique" in err_msg.lower() or "duplicate" in err_msg.lower():
-            return jsonify({"error": "Profile already exists. Use PUT to update."}), 409
-        return jsonify({"error": "Failed to create profile. Please try again."}), 500
+        raise HTTPException(500, "Failed to create profile. Please try again.")
 
-    return jsonify({"message": "Profile created successfully.", **result}), 201
+    return {"message": "Profile created successfully.", **result}
 
 
-@app.route("/students/me", methods=["GET"])
-@jwt_required
-def get_student():
-    """Get the logged-in user's student profile."""
-    cognito_sub = request.user["sub"]
-    _, repo = get_db()
+@app.get(
+    "/students/me",
+    summary="Get my profile",
+    tags=["Students"],
+)
+async def get_student(
+    current_user: dict = Depends(get_current_user),
+    repo: StoredProcedureRepository = Depends(get_repo),
+):
+    """
+    Retrieve the logged-in user's student profile.
 
+    Returns the full profile dict. Returns **404** if no profile exists yet
+    (frontend should redirect to /profile/create).
+    """
+    cognito_sub = current_user["sub"]
     try:
         row = repo.get_student_by_sub(cognito_sub)
     except Exception as exc:
         logger.error("Get student error: %s", exc)
-        return jsonify({"error": "Failed to retrieve profile."}), 500
+        raise HTTPException(500, "Failed to retrieve profile.")
 
     if not row:
-        return jsonify({"error": "Student profile not found."}), 404
+        raise HTTPException(404, "Student profile not found.")
 
     grade = row.get("grade", "")
     if grade in GRAD_GRADE_OPTIONS:
@@ -263,67 +337,60 @@ def get_student():
     else:
         student = StudentModel.from_db_row(row)
 
-    return jsonify(student.to_dict()), 200
+    return student.to_dict()
 
 
-@app.route("/students/me", methods=["PUT"])
-@jwt_required
-def update_student():
-    """Update the logged-in user's student profile."""
-    cognito_sub = request.user["sub"]
-    body = request.get_json(force=True, silent=True) or {}
-
-    _, repo = get_db()
+@app.put(
+    "/students/me",
+    summary="Update my profile",
+    tags=["Students"],
+)
+async def update_student(
+    body: StudentUpdateRequest,
+    current_user: dict = Depends(get_current_user),
+    repo: StoredProcedureRepository = Depends(get_repo),
+):
+    """
+    Update the logged-in user's mutable profile fields.
+    Email cannot be changed (enforced by a database trigger).
+    """
+    cognito_sub = current_user["sub"]
     try:
         updated = repo.update_student(
             cognito_sub=cognito_sub,
-            school=body.get("school", ""),
-            grade=body.get("grade", ""),
-            gpa=float(body.get("gpa", 0)),
-            career_interest=body.get("career_interest", ""),
+            school=body.school,
+            grade=body.grade,
+            gpa=body.gpa,
+            career_interest=body.career_interest,
         )
     except Exception as exc:
         logger.error("Update student error: %s", exc)
-        return jsonify({"error": "Failed to update profile."}), 500
+        raise HTTPException(500, "Failed to update profile.")
 
     if not updated:
-        return jsonify({"error": "Profile not found."}), 404
+        raise HTTPException(404, "Profile not found.")
 
-    return jsonify({"message": "Profile updated successfully."}), 200
+    return {"message": "Profile updated successfully."}
 
 
-# ---------------------------------------------------------------------------
-# Health check
-# ---------------------------------------------------------------------------
+# ── Health check ────────────────────────────────────────────────────────────
 
-@app.route("/health", methods=["GET"])
-def health():
-    """Render uses this to check if the service is up."""
+@app.get("/health", summary="Health check", tags=["System"])
+async def health(repo: StoredProcedureRepository = Depends(get_repo)):
+    """
+    Returns DB connectivity status.
+    Render uses this to decide if the service is healthy.
+    """
     try:
-        db, _ = get_db()
-        db_ok = db.health_check()
+        db_ok = repo._StoredProcedureRepository__db.health_check()
     except Exception:
         db_ok = False
-    status = "ok" if db_ok else "degraded"
-    return jsonify({"status": status, "db": db_ok}), 200 if db_ok else 503
+    return {"status": "ok" if db_ok else "degraded", "db": db_ok}
 
 
-# ---------------------------------------------------------------------------
-# CORS preflight handler (needed for browser fetch from frontend)
-# ---------------------------------------------------------------------------
-
-@app.route("/auth", methods=["OPTIONS"])
-@app.route("/students", methods=["OPTIONS"])
-@app.route("/students/me", methods=["OPTIONS"])
-def handle_options():
-    return "", 204
-
-
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
+# ── Entry point (for local dev) ─────────────────────────────────────────────
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    debug = os.environ.get("FLASK_ENV", "production") == "development"
-    app.run(host="0.0.0.0", port=port, debug=debug)
+    import uvicorn
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run("app:app", host="0.0.0.0", port=port, reload=True)
